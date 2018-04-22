@@ -2,7 +2,6 @@
 #ifndef _ii_hpp
 #define _ii_hpp
 
-#define DELTA_COMPR
 
 #include <iostream>
 #include <vector>
@@ -11,135 +10,8 @@
 
 namespace ii_impl
 {
-	#ifdef DELTA_COMPR
-	template<typename Truncate, typename FeatureObjectLists>
-	class file_abstractor
-	{
-	private:
-
-		Truncate& _trunc;
-		FeatureObjectLists& _features;
-		uint64_t _feature_count;
-		std::vector<uint64_t> _feature_len;
-		std::vector<uint64_t> _feature_offset; // offset of feature start from file start
-		std::size_t _size; // length of file in counts of uint64_t
-
-		// get number of bytes needed to encode the second parameter after the first in variable byte delta encoding
-		uint64_t get_delta_length(uint64_t a, uint64_t b)
-		{
-			if (a >= b) throw std::logic_error("Bad order for delta encoding.");
-			uint64_t d = b - a;
-			for (uint64_t i = 1;; ++i)
-			{
-				if (d < 128) return i;
-				d /= 128;
-			}
-		}
-
-		// Count the lengths of the feature lists and calculate size for truncate
-		void get_lengths()
-		{
-			_size = (2 * _feature_count) + 1; // header of the file - length and index of indexes
-			for (uint64_t i = 0; i < _feature_count; ++i) // calculate length of each feature
-			{
-				_feature_offset[i] = _size;
-				bool first = true; uint64_t prev; uint64_t f_size = 0; // size of feature in bytes
-				for (auto&& o : _features[i])
-				{
-					if (first)
-					{
-						first = false;
-						prev = o;
-						f_size += sizeof(uint64_t);
-						++(_feature_len[i]);
-					}
-					else
-					{
-						auto b = get_delta_length(prev, o);
-						f_size += b;
-						++(_feature_len[i]);
-					}
-				}
-				// padding after each feature to 8 bytes for aligned reading
-				if (f_size % sizeof(uint64_t) != 0)	_size += (f_size / sizeof(uint64_t)) + 1;
-				else _size += f_size / sizeof(uint64_t);
-			}
-		}
-
-		// write value d (calculated delta from caller) as varbyte value, MSB indicates whether this is the last byte
-		void write_delta(uint8_t** bpp, uint64_t d)
-		{
-			while (true)
-			{
-				if (d < 128) // last byte -> set MSB to 1 and end writing
-				{
-					**bpp = (uint8_t)(d + 128); ++(*bpp); // increments the pointer in the calling function
-					return;
-				}
-				else
-				{
-					**bpp = (uint8_t)(d % 128); ++(*bpp);
-					d /= 128;
-				}
-			}
-		}
-
-		void write_data()
-		{
-			// header
-			uint64_t* p = _trunc.data();
-			*p = _feature_count; ++p;
-			for (uint64_t i = 0; i < _feature_count; ++i)
-			{
-				*p = _feature_len[i]; ++p;
-				*p = _feature_offset[i]; ++p;
-			}
-
-			// compressed data
-			for (uint64_t i = 0; i < _feature_count; ++i)
-			{
-				p = _trunc.data() + _feature_offset[i]; // start of block for this feature
-				uint8_t* bp; // unsigned byte pointer for writing var byte deltas
-				bool first = true; uint64_t prev;
-				for (auto&& o : _features[i])
-				{
-					if (first) // first item is always uncompressed
-					{
-						first = false;
-						prev = o;
-						*p = o; ++p;
-						bp = reinterpret_cast<uint8_t*>(p);
-					}
-					else
-					{
-						write_delta(&bp, o - prev);
-						prev = o;
-					}
-				}
-			}
-		}
-
-	public:
-
-		// Creates the actual file from parameters given in constructor
-		void make()
-		{
-			get_lengths();
-			_trunc(_size);
-			write_data();
-		}
-
-		file_abstractor(Truncate&& truncate, FeatureObjectLists&& features) : _trunc(truncate), _features(features)
-		{
-			_feature_count = features.size();
-			_feature_len = std::vector<uint64_t>(_feature_count, 0);
-			_feature_offset = std::vector<uint64_t>(_feature_count, 0);
-		}
-	};
-	#else
-
 template<typename Truncate, typename FeatureObjectLists>
-class file_abstractor // simple version
+class file_abstractor // simple version without delta compression
 {
 private:
 
@@ -262,80 +134,6 @@ public:
 	}
 };
 
-	#endif
-#ifdef DELTA_COMPR
-	// for storing iterators to both the mmapped lists and the vector lists inside the same container
-	class generic_postings_list_iterator
-	{
-	private:
-		std::unique_ptr<std::vector<uint64_t>> _list; std::vector<uint64_t>::const_iterator _iter;
-		const uint8_t* _segment; uint64_t _count; uint64_t _prev; bool first = true; uint64_t _val;
-		bool _memory_storage;
-
-		// Decodes a delta into a document number and stores it in _val
-		void decode_delta()
-		{
-			_prev = _val; _val;
-			for (uint64_t i = 0;; i += 128)
-			{
-				_val += i * ((*_segment) % 128); ++_segment;
-				if (*_segment >= 128) return; // this means it's the last byte
-			}
-		}
-
-	public:
-		bool good; // signifies that operator* will yield a good value, updated on moving the iterator
-
-		// if this is called when good == false, results are undefined
-		uint64_t operator*() const
-		{
-			if (!_memory_storage)
-			{
-				if (first)
-				{
-					return *(reinterpret_cast<const uint64_t*>(_segment));
-				}
-				return _val;
-			}
-			return *_iter;
-		}
-
-		generic_postings_list_iterator& operator++()
-		{
-			if (!_memory_storage)
-			{
-				if (_count <= 1)
-				{
-					good = false; return *this;
-				}
-				--_count;
-				first = false;
-				decode_delta();
-				return *this;
-			}
-			// else vector storage
-			++_iter;
-			if (_iter == _list->cend()) good = false;
-			return *this;
-		}
-
-		generic_postings_list_iterator() {}; // for constructing the vector of appropriate length (no reallocations inside it at runtime)
-		generic_postings_list_iterator(const uint64_t* segment, uint64_t feature) : _memory_storage(false)
-		{
-			uint64_t _offset; const uint64_t* beginning = segment;
-			segment += 1 + (2 * feature); // move pointer to start of this feature's header
-			_count = *segment; ++segment; _offset = *segment;
-			_segment = reinterpret_cast<const uint8_t*>(beginning + _offset); // move pointer to start of this feature's data
-			good = _count > 0;
-		}
-		generic_postings_list_iterator(std::unique_ptr<std::vector<uint64_t>> list) : _list(std::move(list)), _memory_storage(true)
-		{
-			good = _list->size() > 0;
-			_iter = _list->cbegin();
-		}
-	};
-
-#endif
 
 	template<class Fs, class OutFn>
 	class search_task
