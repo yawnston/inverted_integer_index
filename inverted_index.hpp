@@ -9,6 +9,7 @@
 
 namespace ii_impl
 {
+	// Interface for creating variable byte delta encoded postings list files
 	template<typename Truncate, typename FeatureObjectLists>
 	class file_abstractor
 	{
@@ -17,7 +18,7 @@ namespace ii_impl
 		Truncate& _trunc;
 		FeatureObjectLists& _features;
 		uint64_t _feature_count;
-		std::vector<uint64_t> _feature_len;
+		std::vector<uint64_t> _feature_len; // number of items in the postings list for each feature
 		std::vector<uint64_t> _feature_offset; // offset of feature start from file start
 		std::size_t _size; // length of file in counts of uint64_t
 
@@ -57,13 +58,13 @@ namespace ii_impl
 						++(_feature_len[i]);
 					}
 				}
-				// padding after each feature to 8 bytes for aligned reading
+				// padding after each feature to multiple of 8 bytes for aligned reading of 64bit numbers
 				if (f_size % sizeof(uint64_t) != 0)	_size += (f_size / sizeof(uint64_t)) + 1;
 				else _size += f_size / sizeof(uint64_t);
 			}
 		}
 
-		// write value d (calculated delta from caller) as varbyte value, MSB indicates whether this is the last byte
+		// write value d (calculated delta from caller) as varbyte value, MSB == 1 iff this is the last byte
 		void write_delta(uint8_t** bpp, uint64_t d)
 		{
 			while (true)
@@ -100,7 +101,7 @@ namespace ii_impl
 				bool first = true; uint64_t prev;
 				for (auto&& o : _features[i])
 				{
-					if (first) // first item is always uncompressed
+					if (first) // first item is always uncompressed (point of reference for delta)
 					{
 						first = false;
 						prev = o;
@@ -121,6 +122,9 @@ namespace ii_impl
 		// Creates the actual file from parameters given in constructor
 		void make()
 		{
+			// The file is created in two passes
+			// the first pass counts how large the whole file and individual features will be after compression
+			// the second pass after setting the file size writes the actual data
 			get_lengths();
 			_trunc(_size);
 			write_data();
@@ -133,12 +137,16 @@ namespace ii_impl
 			_feature_offset = std::vector<uint64_t>(_feature_count, 0);
 		}
 	};
-	
 
-	// for storing iterators to both the mmapped lists and the vector lists inside the same container
+
+	// for storing iterators to both the mmapped lists and the vector lists inside the same container for task management during the algorithm
+	// represents anything that acts like an iterator over int64_t values
 	class generic_postings_list_iterator
 	{
 	private:
+		// there are some redundant variables depending on what this iterator actually points to, but it's just a few bytes per task
+		// having it this way allows me to make the search algorithm much more clear because all details about where the lists actually are
+		// are abstracted away by this class
 		std::unique_ptr<std::vector<uint64_t>> _list; std::vector<uint64_t>::const_iterator _iter;
 		const uint8_t* _segment; uint64_t _count; uint64_t _prev; bool first = true; uint64_t _val;
 		bool _memory_storage;
@@ -162,7 +170,7 @@ namespace ii_impl
 	public:
 		bool good; // signifies that operator* will yield a good value, updated on moving the iterator
 
-		// if this is called when good == false, results are undefined
+		// if this is called when good == false, results are undefined (probably not pleasant)
 		uint64_t operator*()
 		{
 			if (!_memory_storage)
@@ -174,6 +182,7 @@ namespace ii_impl
 				}
 				return _val;
 			}
+			// else vector storage
 			return *_iter;
 		}
 
@@ -201,7 +210,7 @@ namespace ii_impl
 		}
 
 		generic_postings_list_iterator() {}; // for constructing the vector of appropriate length (no reallocations inside it at runtime)
-		generic_postings_list_iterator(const uint64_t* segment, uint64_t feature) : _memory_storage(false)
+		generic_postings_list_iterator(const uint64_t* segment, uint64_t feature) : _memory_storage(false) // constructor that makes this class iterate over my file format
 		{
 			uint64_t _offset; const uint64_t* beginning = segment;
 			segment += 1 + (2 * feature); // move pointer to start of this feature's header
@@ -209,7 +218,7 @@ namespace ii_impl
 			_segment = reinterpret_cast<const uint8_t*>(beginning + _offset); // move pointer to start of this feature's data
 			good = _count > 0;
 		}
-		generic_postings_list_iterator(std::unique_ptr<std::vector<uint64_t>> list) : _list(std::move(list)), _memory_storage(true)
+		generic_postings_list_iterator(std::unique_ptr<std::vector<uint64_t>> list) : _list(std::move(list)), _memory_storage(true) // makes this class iterate over vectors
 		{
 			good = _list->size() > 0;
 			_iter = _list->cbegin();
@@ -227,7 +236,25 @@ namespace ii_impl
 		uint64_t _feature_count;
 		uint64_t _batch_size; // Number of iterators that will be used during the search (node count of binary tree from the start posting lists)
 		std::vector<std::unique_ptr<generic_postings_list_iterator>> _lists;
-		std::vector<uint64_t> _thread_ids; // IDs of threads taking certain tasks
+
+		// All workers adhere to this policy:
+		//		When checking for available work, they only look at lists between _first and _last.
+		//		They always try to move _first to "reserve" the two items for merging, merging happens 2 lists into one at a time.
+		//		If they succeed, other threads will not attempt to do the same job, because _first was moved by the reserving thread.
+		//		Work is available iff first < last.
+		//		A similar approach is used for storing the computed intersection.
+		//
+		//		To avoid condition variables, workers use semi-active waiting if work is not available.
+		//		To prevent many workers waiting while few are computing, a heuristic is used:
+		//		if there are less remaining jobs than a thread's ID given to it by the algorithm, it kills itself
+		//		this can sometimes lead to an extra few low index threads waiting while high index threads are computing
+		//		but it doesn't happen often and the low index threads instantly yield.
+		//
+		//		An alternate approach I considered was using condition variables, but I decided against it because it would 
+		//		slow down the common case (lists are similar length, threads have similar work loads) by syscalling too much.
+		//		It would help in the case where some threads are under disproportionate load(very long vs very short lists)
+		//		but I would consider that a degenerate case, instead I optimized for the common case.
+		//		Even then, the slowdown of occasionally being planned and yielding right away isn't that much.
 		std::atomic<uint64_t> _first;
 		std::atomic<uint64_t> _last;
 
@@ -235,7 +262,7 @@ namespace ii_impl
 
 		void prepare()
 		{
-			if (_feature_count == 0) return;
+			if (_feature_count == 0) return; // prevents nasty things from happening due to integer underflow
 			_last.store(_feature_count - 1); uint64_t i = 0;
 			for (auto&& f : _fs)
 			{
@@ -246,6 +273,7 @@ namespace ii_impl
 		}
 
 		// merge the list at index with the one at index + 1 and store the result at the end of _lists
+		// guarantees thread safe storing of the result
 		void merge(uint64_t index)
 		{
 			auto l = std::make_unique<std::vector<uint64_t>>();
@@ -274,11 +302,14 @@ namespace ii_impl
 				if (success) // we managed to reserve space for storing the result
 				{
 					_lists[idx + 1] = std::move(result);
+					_lists[index].reset(); _lists[index + 1].reset(); // we no longer need the old postings lists -> free up their memory
 					break;
 				}
 			}
 		}
 
+		// worker threads for list merging do this function
+		// guarantees thread safe acquisition of lists to merge
 		void worker_func(uint64_t id)
 		{
 			uint64_t f, l;
@@ -286,13 +317,12 @@ namespace ii_impl
 			{
 				// check if there are two lists to merge
 				f = _first.load(); l = _last.load();
-				if (l > f && l - f >= 1)
+				if (l > f)
 				{
 					// try to reserve the first 2 items
 					bool success = _first.compare_exchange_weak(f, f + 2);
 					if (success) // managed to reserve 2 items -> merge them
 					{
-						_thread_ids[f] = id; _thread_ids[f + 1] = id;
 						merge(f);
 					}
 					else std::this_thread::yield(); // there is work but another thread reserved it before us -> yield
@@ -300,7 +330,7 @@ namespace ii_impl
 				else
 				{
 					// there was no work -> worker dies if its ID is higher or equal to the amount of remaining jobs
-					if (_batch_size - 1 -f <= id) return;
+					if (_batch_size - 1 - f <= id) return;
 					std::this_thread::yield(); // worker shouldn't die yet but has no work -> yield and wait for other threads to finish their work
 				}
 			}
@@ -308,16 +338,16 @@ namespace ii_impl
 
 		void run()
 		{
-			if (_feature_count == 0) return;
+			if (_feature_count == 0) return; // no features -> no objects
 			std::vector<std::thread> workers; auto worker_count = std::thread::hardware_concurrency();
-			if (worker_count == 0) worker_count = 16; // backup number of threads
+			if (worker_count == 0) worker_count = 16; // backup number of threads if hardware_concurrency() fails
 			for (uint64_t i = 0; i < worker_count; ++i)
 			{
 				workers.push_back(std::thread([this, i] { this->worker_func(i); }));
 			}
 			for (auto&& w : workers) w.join();
-			// last item in the vector is the result postings list -> call the callback function on it
-			for (generic_postings_list_iterator* i = (_lists[_batch_size - 1]).get(); i->good; i->operator++())
+			// last list in the vector is the result postings list -> call the callback function on its elements
+			for (generic_postings_list_iterator* i = (_lists[_batch_size - 1]).get(); i->good; ++(*i))
 			{
 				_callback(**i);
 			}
@@ -326,7 +356,7 @@ namespace ii_impl
 		search_task(const uint64_t* segment, Fs&& fs, OutFn&& callback) : _segment(segment), _fs(fs), _callback(callback), _first(0), _last(0)
 		{
 			_batch_size = 0; uint64_t n = 0;
-			for (auto&& f : fs) ++n; // count features
+			for (auto&& f : fs) ++n; // count features manually since it is not guaranteed that fs will have size() function
 			_feature_count = n;
 			while (true) // calculate number of spaces needed for storing the iterators
 			{
@@ -335,7 +365,6 @@ namespace ii_impl
 				n = (n / 2) + (n % 2); // if there was anything left over, add it to the next level
 			}
 			_lists = std::vector<std::unique_ptr<generic_postings_list_iterator>>(_batch_size);
-			_thread_ids = std::vector<uint64_t>(_batch_size, 69);
 		}
 	};
 }
@@ -354,26 +383,22 @@ namespace ii
 		file.make();
 	}
 
+	// Search algorithm:
+	//	There is a task queue containing iterators over posting lists
+	//	Worker threads periodically try to pull two oldest lists from the queue and intersect them into a new one, adding it to the end of the queue
+	//	The whole algorithm is lock-free (if the compiler generates atomic instructions for std::atomic<uint64_t>, it may decide to use mutexes instead)
+	//	This is accomplished with the queue actually being a vector of unique_pointers of length roughly 2 * feature count
+	//	Worker threads adhere to a policy that is described in detail in the search_task class, using atomic uints for synchronization
 	template<class Fs, class OutFn>
 	void search(const uint64_t* segment, size_t size, Fs&& fs, OutFn&& callback)
 	{
-		// Prepare iterators from segment into the task queue
-
-		// Compute total amount of tasks needed to obtain result (for killing threads that are reduntant at the end)
-
+		// size parameter is unused, the file format itself knows how long it is
+		// Initialize the task with input data
 		ii_impl::search_task<Fs, OutFn> task(segment, std::forward<Fs>(fs), std::forward<OutFn>(callback));
 		task.prepare();
 
 		// Start worker threads on task queue
-
 		task.run();
-
-		// Workers infinite loop, waiting for work, and trying to compare_exchange_weak to reserve when they think there is work
-
-		// Worker thread dies if its index is bigger than number of tasks remaining and it has nothing to do
-		// This doesn't always work perfectly (high index threads could be doing last bit of work while low index threads yield in a loop)
-
-		// The task queue contains the result at the end
 	}
 
 }; //namespace ii
