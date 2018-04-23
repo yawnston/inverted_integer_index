@@ -237,6 +237,7 @@ namespace ii_impl
 		uint64_t _feature_count;
 		uint64_t _batch_size; // Number of iterators that will be used during the search (node count of binary tree from the start posting lists)
 		std::vector<std::unique_ptr<generic_postings_list_iterator>> _lists;
+		std::vector<bool> _ready;
 
 		// All workers adhere to this policy:
 		//		When checking for available work, they only look at lists between _first and _last.
@@ -269,6 +270,7 @@ namespace ii_impl
 			{
 				auto l = std::make_unique<generic_postings_list_iterator>(_segment, f);
 				_lists[i] = std::move(l);
+				_ready[i] = true;
 				++i;
 			}
 		}
@@ -303,6 +305,7 @@ namespace ii_impl
 				if (success) // we managed to reserve space for storing the result
 				{
 					_lists[idx + 1] = std::move(result);
+					_ready[idx + 1] = true;
 					_lists[index].reset(); _lists[index + 1].reset(); // we no longer need the old postings lists -> free up their memory
 					break;
 				}
@@ -324,6 +327,7 @@ namespace ii_impl
 					bool success = _first.compare_exchange_weak(f, f + 2);
 					if (success) // managed to reserve 2 items -> merge them
 					{
+						while (!_ready[f] || !_ready[f + 1]) std::this_thread::yield(); // prevents race condition when a thread says it completed its work but results are not there yet
 						merge(f);
 					}
 					else std::this_thread::yield(); // there is work but another thread reserved it before us -> yield
@@ -366,6 +370,7 @@ namespace ii_impl
 				n = (n / 2) + (n % 2); // if there was anything left over, add it to the next level
 			}
 			_lists = std::vector<std::unique_ptr<generic_postings_list_iterator>>(_batch_size);
+			_ready = std::vector<bool>(_batch_size, false);
 		}
 	};
 }
@@ -387,7 +392,7 @@ namespace ii
 	// Search algorithm:
 	//	There is a task queue containing iterators over posting lists
 	//	Worker threads periodically try to pull two oldest lists from the queue and intersect them into a new one, adding it to the end of the queue
-	//	The whole algorithm is lock-free (if the compiler generates atomic instructions for std::atomic<uint64_t>, it may decide to use mutexes instead)
+	//	The whole algorithm is (sort of) lock-free (if the compiler generates atomic instructions for std::atomic<uint64_t>, it may decide to use mutexes instead)
 	//	This is accomplished with the queue actually being a vector of unique_pointers of length roughly 2 * feature count
 	//	Worker threads adhere to a policy that is described in detail in the search_task class, using atomic uints for synchronization
 	template<class Fs, class OutFn>
