@@ -21,6 +21,7 @@ private:
 	std::vector<uint64_t> _feature_len;
 	std::vector<uint64_t> _feature_offset; // offset of feature start from file start
 	std::size_t _size; // length of file in counts of uint64_t
+	uint64_t _begin;
 
 
 	// Count the lengths of the feature lists and calculate size for truncate
@@ -41,7 +42,7 @@ private:
 	void write_data()
 	{
 		// header
-		uint64_t* p = _trunc.data();
+		uint64_t* p = _begin;
 		*p = _feature_count; ++p;
 		for (uint64_t i = 0; i < _feature_count; ++i)
 		{
@@ -52,7 +53,7 @@ private:
 		// compressed data
 		for (uint64_t i = 0; i < _feature_count; ++i)
 		{
-			p = _trunc.data() + _feature_offset[i]; // start of block for this feature
+			p = _begin + _feature_offset[i]; // start of block for this feature
 			for (auto&& o : _features[i])
 			{
 				*p = o; ++p;
@@ -66,7 +67,7 @@ public:
 	void make()
 	{
 		get_lengths();
-		_trunc(_size);
+		_begin = _trunc(_size);
 		write_data();
 	}
 
