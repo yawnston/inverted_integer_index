@@ -21,6 +21,7 @@ namespace ii_impl
 		std::vector<uint64_t> _feature_len; // number of items in the postings list for each feature
 		std::vector<uint64_t> _feature_offset; // offset of feature start from file start
 		std::size_t _size; // length of file in counts of uint64_t
+		uint64_t* _begin;
 
 		// get number of bytes needed to encode the second parameter after the first in variable byte delta encoding
 		uint64_t get_delta_length(uint64_t a, uint64_t b)
@@ -85,7 +86,7 @@ namespace ii_impl
 		void write_data()
 		{
 			// header
-			uint64_t* p = _trunc.data();
+			uint64_t* p = _begin;
 			*p = _feature_count; ++p;
 			for (uint64_t i = 0; i < _feature_count; ++i)
 			{
@@ -96,7 +97,7 @@ namespace ii_impl
 			// compressed data
 			for (uint64_t i = 0; i < _feature_count; ++i)
 			{
-				p = _trunc.data() + _feature_offset[i]; // start of block for this feature
+				p = _begin + _feature_offset[i]; // start of block for this feature
 				uint8_t* bp; // unsigned byte pointer for writing var byte deltas
 				bool first = true; uint64_t prev;
 				for (auto&& o : _features[i])
@@ -126,7 +127,7 @@ namespace ii_impl
 			// the first pass counts how large the whole file and individual features will be after compression
 			// the second pass after setting the file size writes the actual data
 			get_lengths();
-			_trunc(_size);
+			_begin = _trunc(_size);
 			write_data();
 		}
 
